@@ -397,38 +397,38 @@ async def post_panel_and_confirm(interaction: discord.Interaction, chosen_label:
             await interaction.followup.send("入力セッションが見つかりません。最初からやり直してください。", ephemeral=True)
         return
 
+    # 表示する入社日程テキスト
     schedule_text = data.get("custom_time") if chosen_value == "other" else chosen_label
     if not schedule_text:
         schedule_text = "（自由入力なし）"
 
-    # ===== Embed（※ 上部のID表示とプロフィール欄を非表示に）=====
+    # ===== エントリーパネル（Discord ID の表示を削除）=====
     embed = discord.Embed(
         title="入社エントリー",
         description="以下の内容で受付しました。",
-        color=discord.Color.blue()
+        color=discord.Color.blue(),
     )
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="お名前", value=data["name"], inline=False)
     embed.add_field(name="入社日程", value=schedule_text, inline=False)
     embed.add_field(name="紹介者", value=data["referrer"], inline=False)
-    embed.add_field(name="Discord ID", value=str(user.id), inline=False)
-    # （プロフィール直リンクや author の ID 表示は行わない）
+    # ※ Discord ID フィールドは表示しない
 
-    # エントリーパネル送信（下に操作ボタンを付ける）
+    # メッセージ送信（下に「面接済み」「応答無し」ボタン）
     target_channel = interaction.channel or (await user.create_dm())
     sent_msg = await target_channel.send(embed=embed, view=EntryStatusControlView())
 
-    # レコード保存
+    # レコード保存（予定表用／内部的には user_id を保持します）
     try:
         guild_id = interaction.guild.id if interaction.guild else 0
         add_entry_record(
             guild_id=guild_id,
             channel_id=sent_msg.channel.id,
             message_id=sent_msg.id,
-            user_id=user.id,
+            user_id=user.id,  # ←内部保持のみ
             name=data["name"],
             referrer=data["referrer"],
-            slot_key=chosen_value,     # "0-3" / "anytime" / "other"
+            slot_key=chosen_value,  # "0-3" / "anytime" / "other"
             custom_time=data.get("custom_time"),
         )
     except Exception as e:
@@ -437,13 +437,13 @@ async def post_panel_and_confirm(interaction: discord.Interaction, chosen_label:
     # 片付け
     TEMP_ENTRY.pop(user.id, None)
 
-    # 応答
+    # 応答（未応答/応答済みで分岐）
     if not interaction.response.is_done():
         await interaction.response.send_message("送信しました。ありがとうございます！", ephemeral=True)
     else:
         await interaction.followup.send("送信しました。ありがとうございます！", ephemeral=True)
 
-    # 最下部ボタン維持
+    # “最下部ボタン”維持
     if isinstance(target_channel, discord.TextChannel):
         await ensure_sticky_bottom(target_channel)
 
@@ -543,3 +543,4 @@ if __name__ == "__main__":
     except Exception:
         log.warning("keep_alive サーバーは起動しませんでした（ローカルなど）")
     main()
+
