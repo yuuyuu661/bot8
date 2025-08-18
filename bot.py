@@ -392,33 +392,37 @@ async def post_panel_and_confirm(interaction: discord.Interaction, chosen_label:
     data = TEMP_ENTRY.get(user.id)
     if not data:
         if not interaction.response.is_done():
-            await interaction.response.send_message("入力セッションが見つかりません。最初からやり直してください。", ephemeral=True)
+            await interaction.response.send_message(
+                "入力セッションが見つかりません。最初からやり直してください。", ephemeral=True
+            )
         else:
-            await interaction.followup.send("入力セッションが見つかりません。最初からやり直してください。", ephemeral=True)
+            await interaction.followup.send(
+                "入力セッションが見つかりません。最初からやり直してください。", ephemeral=True
+            )
         return
 
+    # 表示する入社日程テキスト
     schedule_text = data.get("custom_time") if chosen_value == "other" else chosen_label
     if not schedule_text:
         schedule_text = "（自由入力なし）"
 
-    # ===== Embed（※ 上部のID表示とプロフィール欄を非表示に）=====
+    # ===== エントリーパネル（Embed） =====
     embed = discord.Embed(
         title="入社エントリー",
         description="以下の内容で受付しました。",
-        color=discord.Color.blue()
+        color=discord.Color.blue(),
     )
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="お名前", value=data["name"], inline=False)
     embed.add_field(name="入社日程", value=schedule_text, inline=False)
     embed.add_field(name="紹介者", value=data["referrer"], inline=False)
     embed.add_field(name="Discord ID", value=str(user.id), inline=False)
-    # （プロフィール直リンクや author の ID 表示は行わない）
 
-    # エントリーパネル送信（下に操作ボタンを付ける）
+    # メッセージ送信（下に「面接済み」「応答無し」ボタン）
     target_channel = interaction.channel or (await user.create_dm())
     sent_msg = await target_channel.send(embed=embed, view=EntryStatusControlView())
 
-    # レコード保存
+    # レコード保存（予定表用）
     try:
         guild_id = interaction.guild.id if interaction.guild else 0
         add_entry_record(
@@ -428,4 +432,25 @@ async def post_panel_and_confirm(interaction: discord.Interaction, chosen_label:
             user_id=user.id,
             name=data["name"],
             referrer=data["referrer"],
-            slot_key=chosen_
+            slot_key=chosen_value,  # "0-3" / "anytime" / "other"
+            custom_time=data.get("custom_time"),
+        )
+    except Exception as e:
+        log.exception("add_entry_record failed: %s", e)
+
+    # 入力キャッシュ掃除
+    TEMP_ENTRY.pop(user.id, None)
+
+    # 応答（未応答/応答済みで分岐）
+    if not interaction.response.is_done():
+        await interaction.response.send_message("送信しました。ありがとうございます！", ephemeral=True)
+    else:
+        await interaction.followup.send("送信しました。ありがとうございます！", ephemeral=True)
+
+    # “最下部ボタン”維持
+    if isinstance(target_channel, discord.TextChannel):
+        await ensure_sticky_bottom(target_channel)
+
+    # 予定表を更新
+    await update_schedule_panel()
+
