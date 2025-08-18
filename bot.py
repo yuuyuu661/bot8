@@ -392,37 +392,33 @@ async def post_panel_and_confirm(interaction: discord.Interaction, chosen_label:
     data = TEMP_ENTRY.get(user.id)
     if not data:
         if not interaction.response.is_done():
-            await interaction.response.send_message(
-                "入力セッションが見つかりません。最初からやり直してください。", ephemeral=True
-            )
+            await interaction.response.send_message("入力セッションが見つかりません。最初からやり直してください。", ephemeral=True)
         else:
-            await interaction.followup.send(
-                "入力セッションが見つかりません。最初からやり直してください。", ephemeral=True
-            )
+            await interaction.followup.send("入力セッションが見つかりません。最初からやり直してください。", ephemeral=True)
         return
 
-    # 表示する入社日程テキスト
     schedule_text = data.get("custom_time") if chosen_value == "other" else chosen_label
     if not schedule_text:
         schedule_text = "（自由入力なし）"
 
-    # ===== エントリーパネル（Embed） =====
+    # ===== Embed（※ 上部のID表示とプロフィール欄を非表示に）=====
     embed = discord.Embed(
         title="入社エントリー",
         description="以下の内容で受付しました。",
-        color=discord.Color.blue(),
+        color=discord.Color.blue()
     )
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="お名前", value=data["name"], inline=False)
     embed.add_field(name="入社日程", value=schedule_text, inline=False)
     embed.add_field(name="紹介者", value=data["referrer"], inline=False)
     embed.add_field(name="Discord ID", value=str(user.id), inline=False)
+    # （プロフィール直リンクや author の ID 表示は行わない）
 
-    # メッセージ送信（下に「面接済み」「応答無し」ボタン）
+    # エントリーパネル送信（下に操作ボタンを付ける）
     target_channel = interaction.channel or (await user.create_dm())
     sent_msg = await target_channel.send(embed=embed, view=EntryStatusControlView())
 
-    # レコード保存（予定表用）
+    # レコード保存
     try:
         guild_id = interaction.guild.id if interaction.guild else 0
         add_entry_record(
@@ -432,25 +428,118 @@ async def post_panel_and_confirm(interaction: discord.Interaction, chosen_label:
             user_id=user.id,
             name=data["name"],
             referrer=data["referrer"],
-            slot_key=chosen_value,  # "0-3" / "anytime" / "other"
+            slot_key=chosen_value,     # "0-3" / "anytime" / "other"
             custom_time=data.get("custom_time"),
         )
     except Exception as e:
         log.exception("add_entry_record failed: %s", e)
 
-    # 入力キャッシュ掃除
+    # 片付け
     TEMP_ENTRY.pop(user.id, None)
 
-    # 応答（未応答/応答済みで分岐）
+    # 応答
     if not interaction.response.is_done():
         await interaction.response.send_message("送信しました。ありがとうございます！", ephemeral=True)
     else:
         await interaction.followup.send("送信しました。ありがとうございます！", ephemeral=True)
 
-    # “最下部ボタン”維持
+    # 最下部ボタン維持
     if isinstance(target_channel, discord.TextChannel):
         await ensure_sticky_bottom(target_channel)
 
-    # 予定表を更新
+    # 予定表更新
     await update_schedule_panel()
 
+# ==========================
+#  Slash コマンド
+# ==========================
+@tree.command(description="入社日程案内のボタンを“最下部に常時表示”として設置します")
+async def entry_panel(interaction: discord.Interaction):
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("このコマンドはテキストチャンネルで使ってください。", ephemeral=True)
+        return
+    await interaction.response.send_message("最下部にボタンを設置します。", ephemeral=True)
+    await ensure_sticky_bottom(interaction.channel)
+
+@tree.command(description="このチャンネルの“最下部ボタン”を解除します")
+async def entry_panel_off(interaction: discord.Interaction):
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("このコマンドはテキストチャンネルで使ってください。", ephemeral=True)
+        return
+    ch_id = interaction.channel.id
+    msg_id = STICKY_STATE.pop(ch_id, None)
+    save_sticky()
+    if msg_id:
+        await delete_message_if_exists(interaction.channel, msg_id)
+        await interaction.response.send_message("このチャンネルの最下部ボタンを解除しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("このチャンネルには有効な最下部ボタンがありません。", ephemeral=True)
+
+@tree.command(description="予定表を手動で再生成・更新します（ログチャンネル）")
+async def schedule_refresh(interaction: discord.Interaction):
+    await update_schedule_panel()
+    await interaction.response.send_message("予定表を更新しました。", ephemeral=True)
+
+@tree.command(description="疎通確認（/ping）")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("pong 🏓")
+
+# ==========================
+#  メッセージイベント：だれかが発言したら “最下部ボタン” を底に再配置
+# ==========================
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    await bot.process_commands(message)
+    if isinstance(message.channel, discord.TextChannel) and message.channel.id in STICKY_STATE:
+        await ensure_sticky_bottom(message.channel)
+
+# ==========================
+#  起動時処理
+# ==========================
+@bot.event
+async def on_ready():
+    log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    load_states()
+
+    # 永続ビューを再登録（ボタンの押下を再起動後も処理可能に）
+    bot.add_view(EntryButtonView())
+    bot.add_view(EntryStatusControlView())
+
+    # Sticky 整合
+    for ch_id in list(STICKY_STATE.keys()):
+        channel = bot.get_channel(ch_id)
+        if isinstance(channel, discord.TextChannel):
+            asyncio.create_task(ensure_sticky_bottom(channel))
+
+    # 予定表の確保＆初期更新
+    asyncio.create_task(update_schedule_panel())
+
+    if SYNC_ON_START:
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                synced = await tree.sync(guild=guild)
+                log.info(f"Synced {len(synced)} commands to guild {GUILD_ID}")
+            else:
+                synced = await tree.sync()
+                log.info(f"Synced {len(synced)} global commands")
+        except Exception as e:
+            log.exception("Failed to sync commands: %s", e)
+
+# ==========================
+#  エントリーポイント
+# ==========================
+def main():
+    if not DISCORD_TOKEN:
+        raise RuntimeError("環境変数 DISCORD_TOKEN が未設定です。Railway Variables で設定してください。")
+    bot.run(DISCORD_TOKEN)
+
+if __name__ == "__main__":
+    try:
+        from keep_alive import run_server
+        asyncio.get_event_loop().create_task(run_server())
+    except Exception:
+        log.warning("keep_alive サーバーは起動しませんでした（ローカルなど）")
+    main()
