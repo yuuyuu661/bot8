@@ -1,3 +1,4 @@
+# bot.py
 import os
 import json
 import time
@@ -18,10 +19,10 @@ log = logging.getLogger("bot")
 
 # ===== 環境変数 =====
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")  # 即時反映したいギルド（任意）
+GUILD_ID = os.getenv("GUILD_ID")  # 即時同期（任意）
 SYNC_ON_START = os.getenv("SYNC_ON_START", "1") == "1"
-SCHEDULE_CHANNEL_ID = os.getenv("SCHEDULE_CHANNEL_ID")  # 予定表出力先チャンネルID
-ENTRY_MANAGER_ROLE_ID = int(os.getenv("ENTRY_MANAGER_ROLE_ID", "1398724601256874014"))  # ボタン操作を許可するロール
+SCHEDULE_CHANNEL_ID = os.getenv("SCHEDULE_CHANNEL_ID")  # 予定表出力先
+ENTRY_MANAGER_ROLE_ID = int(os.getenv("ENTRY_MANAGER_ROLE_ID", "1398724601256874014"))  # 操作権限ロール
 
 # ===== Intents =====
 intents = discord.Intents.default()
@@ -39,7 +40,7 @@ TIME_OPTIONS: List[tuple[str, str]] = [
     ("12-15時", "12-15"),
     ("15-20時", "15-20"),
     ("20-0時", "20-0"),
-    ("いつでも", "anytime"),        # 追加
+    ("いつでも", "anytime"),            # 追加
     ("その他（自由入力）", "other"),
 ]
 SLOT_ORDER: List[tuple[str, str]] = [
@@ -211,14 +212,19 @@ def _build_schedule_embed() -> discord.Embed:
             lines = []
             for e in items:
                 name = e.get("name", "不明")
+                user_id = e.get("user_id")
+                mention = f"<@{user_id}>" if user_id else ""
                 link = _message_link(e["guild_id"], e["channel_id"], e["message_id"])
+
                 if key == "other" and e.get("custom_time"):
-                    lines.append(f"- {name}（{e['custom_time']}） — [メッセージ]({link})")
+                    lines.append(f"- {name} {mention}（{e['custom_time']}） — [メッセージ]({link})")
                 else:
-                    lines.append(f"- {name} — [メッセージ]({link})")
+                    lines.append(f"- {name} {mention} — [メッセージ]({link})")
+
             value = "\n".join(lines)
             if len(value) > 1024:
                 value = value[:1000] + "\n…（続きあり）"
+
         embed.add_field(name=label, value=value, inline=False)
     return embed
 
@@ -239,8 +245,10 @@ async def ensure_schedule_message() -> Optional[discord.Message]:
         except Exception as e:
             log.exception("fetch schedule message failed: %s", e)
     try:
-        embed = _build_schedule_embed()
-        msg = await channel.send(embed=embed)
+        msg = await channel.send(
+            embed=_build_schedule_embed(),
+            allowed_mentions=discord.AllowedMentions.none()  # 通知OFFでクリック可
+        )
         SCHEDULE_STATE["schedule_channel_id"] = channel.id
         SCHEDULE_STATE["message_id"] = msg.id
         save_schedule_state()
@@ -254,8 +262,10 @@ async def update_schedule_panel():
     if not msg:
         return
     try:
-        embed = _build_schedule_embed()
-        await msg.edit(embed=embed)
+        await msg.edit(
+            embed=_build_schedule_embed(),
+            allowed_mentions=discord.AllowedMentions.none()  # 通知OFFでクリック可
+        )
     except Exception as e:
         log.exception("update schedule message failed: %s", e)
 
@@ -271,7 +281,7 @@ def add_entry_record(guild_id: int, channel_id: int, message_id: int,
         "referrer": referrer,
         "slot_key": slot_key,
         "custom_time": custom_time,
-        "status": "active",          # ★ 追加：初期状態は active
+        "status": "active",          # 初期状態は active
         "ts": time.time(),
     })
     save_entries()
@@ -331,7 +341,7 @@ async def ensure_sticky_bottom(channel: discord.TextChannel):
             save_sticky()
 
 # ==========================
-#  エントリーパネル送信 + 確認
+#  エントリーパネル（送信＆確認）
 # ==========================
 class EntryStatusControlView(discord.ui.View):
     """エントリーパネル下の操作ボタン（面接済み / 応答無し）。永続ビュー。"""
@@ -397,35 +407,34 @@ async def post_panel_and_confirm(interaction: discord.Interaction, chosen_label:
             await interaction.followup.send("入力セッションが見つかりません。最初からやり直してください。", ephemeral=True)
         return
 
-    # 表示する入社日程テキスト
+    # 表示用テキスト
     schedule_text = data.get("custom_time") if chosen_value == "other" else chosen_label
     if not schedule_text:
         schedule_text = "（自由入力なし）"
 
-    # ===== エントリーパネル（Discord ID の表示を削除）=====
+    # ===== エントリーパネル（Discord ID/プロフィール類は非表示）=====
     embed = discord.Embed(
         title="入社エントリー",
         description="以下の内容で受付しました。",
-        color=discord.Color.blue(),
+        color=discord.Color.blue()
     )
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="お名前", value=data["name"], inline=False)
     embed.add_field(name="入社日程", value=schedule_text, inline=False)
     embed.add_field(name="紹介者", value=data["referrer"], inline=False)
-    # ※ Discord ID フィールドは表示しない
 
-    # メッセージ送信（下に「面接済み」「応答無し」ボタン）
+    # エントリーパネル送信（下に「面接済み」「応答無し」ボタン）
     target_channel = interaction.channel or (await user.create_dm())
     sent_msg = await target_channel.send(embed=embed, view=EntryStatusControlView())
 
-    # レコード保存（予定表用／内部的には user_id を保持します）
+    # レコード保存（予定表用）
     try:
         guild_id = interaction.guild.id if interaction.guild else 0
         add_entry_record(
             guild_id=guild_id,
             channel_id=sent_msg.channel.id,
             message_id=sent_msg.id,
-            user_id=user.id,  # ←内部保持のみ
+            user_id=user.id,  # 内部保持のみ
             name=data["name"],
             referrer=data["referrer"],
             slot_key=chosen_value,  # "0-3" / "anytime" / "other"
@@ -485,7 +494,7 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong 🏓")
 
 # ==========================
-#  メッセージイベント：だれかが発言したら “最下部ボタン” を底に再配置
+#  メッセージイベント：発言があれば“最下部ボタン”を底に再配置
 # ==========================
 @bot.event
 async def on_message(message: discord.Message):
@@ -503,7 +512,7 @@ async def on_ready():
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     load_states()
 
-    # 永続ビューを再登録（ボタンの押下を再起動後も処理可能に）
+    # 永続ビュー再登録
     bot.add_view(EntryButtonView())
     bot.add_view(EntryStatusControlView())
 
@@ -513,7 +522,7 @@ async def on_ready():
         if isinstance(channel, discord.TextChannel):
             asyncio.create_task(ensure_sticky_bottom(channel))
 
-    # 予定表の確保＆初期更新
+    # 予定表 初期更新
     asyncio.create_task(update_schedule_panel())
 
     if SYNC_ON_START:
@@ -543,4 +552,3 @@ if __name__ == "__main__":
     except Exception:
         log.warning("keep_alive サーバーは起動しませんでした（ローカルなど）")
     main()
-
