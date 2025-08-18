@@ -174,33 +174,59 @@ async def post_panel_and_confirm(interaction: discord.Interaction, chosen_label:
             await interaction.followup.send("入力セッションが見つかりません。最初からやり直してください。", ephemeral=True)
         return
 
+    # 入社日程の表示文
     schedule_text = data.get("custom_time") if chosen_value == "other" else chosen_label
     if not schedule_text:
         schedule_text = "（自由入力なし）"
 
+    # ===== Embed（パネル）=====
     embed = discord.Embed(
         title="入社エントリー",
-        color=discord.Color.blue(),
-        description="以下の内容で受付しました。"
+        description="以下の内容で受付しました。",
+        color=discord.Color.blue()
     )
+
+    # ✅ 送信者の横にユーザーIDを表示し、クリックでプロフィールへ飛べるように
+    #   - author行はクリック可能（URLに https://discord.com/users/<ID> を指定）
+    #   - 送信者のアイコンも表示されます
+    embed.set_author(
+        name=f"{user.display_name}（ID: {user.id}）",
+        icon_url=user.display_avatar.url,
+        url=f"https://discord.com/users/{user.id}"
+    )
+
+    # プロフィール画像（サムネイル）も従来通り表示
     embed.set_thumbnail(url=user.display_avatar.url)
+
+    # 入力内容
     embed.add_field(name="お名前", value=data["name"], inline=False)
     embed.add_field(name="入社日程", value=schedule_text, inline=False)
     embed.add_field(name="紹介者", value=data["referrer"], inline=False)
-    embed.add_field(name="Discord ID", value=str(user.id), inline=False)
-    embed.set_footer(text=f"送信者: {user.display_name}")
 
+    # 元仕様どおり Discord ID も項目として掲載（author横にもあるが要件維持のため）
+    embed.add_field(name="Discord ID", value=str(user.id), inline=False)
+
+    # おまけ：プロフィール直リンク/メンションも置いておく（クリック手段をもう1つ用意）
+    embed.add_field(
+        name="プロフィール",
+        value=f"[プロフィールを開く](https://discord.com/users/{user.id})\n{user.mention}",
+        inline=False
+    )
+
+    # 同じチャンネルへ投稿（なければDM）
     target_channel = interaction.channel or (await user.create_dm())
     await target_channel.send(embed=embed)
 
+    # 一時データ破棄
     TEMP_ENTRY.pop(user.id, None)
 
+    # エフェメラル通知（未応答/応答済みで分岐）
     if not interaction.response.is_done():
         await interaction.response.send_message("送信しました。ありがとうございます！", ephemeral=True)
     else:
         await interaction.followup.send("送信しました。ありがとうございます！", ephemeral=True)
 
-    # 送信のたびに“最下部ボタン”も維持
+    # “最下部ボタン”維持（あなたの実装に合わせて）
     if isinstance(target_channel, discord.TextChannel):
         await ensure_sticky_bottom(target_channel)
 
@@ -369,3 +395,4 @@ if __name__ == "__main__":
     except Exception:
         log.warning("keep_alive サーバーは起動しませんでした（ローカルなど）")
     main()
+
