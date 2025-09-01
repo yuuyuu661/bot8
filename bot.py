@@ -20,7 +20,7 @@ log = logging.getLogger("bot")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")  # 即時同期（任意）
 SYNC_ON_START = os.getenv("SYNC_ON_START", "1") == "1"
-SCHEDULE_CHANNEL_ID = os.getenv("SCHEDULE_CHANNEL_ID")  # 予定表出力先
+SCHEDULE_CHANNEL_ID = os.getenv("SCHEDULE_CHANNEL_ID")  # 予定表出力先チャンネルID
 ENTRY_MANAGER_ROLE_ID = int(os.getenv("ENTRY_MANAGER_ROLE_ID", "1398724601256874014"))
 
 # ===== 保存ディレクトリ =====
@@ -31,7 +31,7 @@ STICKY_FILE = os.path.join(DATA_DIR, "sticky.json")
 ENTRIES_FILE = os.path.join(DATA_DIR, "entries.json")
 SCHEDULE_STATE_FILE = os.path.join(DATA_DIR, "schedule_state.json")
 
-# ===== Intents =====
+# ===== Intents / Bot =====
 intents = discord.Intents.default()
 intents.guilds = True
 intents.messages = True
@@ -65,10 +65,10 @@ SLOT_ORDER: List[tuple[str, str]] = [
 ]
 
 # ====== 状態保持 ======
-STICKY_STATE: Dict[int, int] = {}
-ENTRIES: List[Dict] = []
-SCHEDULE_STATE: Dict[str, int] = {}
-TEMP_ENTRY: Dict[int, Dict] = {}
+STICKY_STATE: Dict[int, int] = {}       # {channel_id: message_id}
+ENTRIES: List[Dict] = []                # 例：{guild_id, channel_id, message_id, user_id, name, referrer, slot_key, custom_time, status, ts}
+SCHEDULE_STATE: Dict[str, int] = {}     # {"schedule_channel_id": ..., "message_id": ...}
+TEMP_ENTRY: Dict[int, Dict] = {}        # user_id -> {"name":..., "referrer":..., "custom_time":...}
 
 # ====== JSONユーティリティ ======
 def _load_json(path: str, default):
@@ -103,13 +103,11 @@ def save_schedule_state():
     _save_json(SCHEDULE_STATE_FILE, SCHEDULE_STATE)
 
 # ====== 重複登録防止 ======
-BLOCK_STATUSES = {"active", "interviewed"}
+BLOCK_STATUSES = {"active", "interviewed"}  # active/面接済み の場合は再エントリー不可
 
 def user_has_blocking_entries(user_id: int) -> bool:
-    return any(
-        e.get("user_id") == int(user_id) and e.get("status", "active") in BLOCK_STATUSES
-        for e in ENTRIES
-    )
+    uid = int(user_id)
+    return any(e.get("user_id") == uid and e.get("status", "active") in BLOCK_STATUSES for e in ENTRIES)
 
 # ==========================
 #  モーダル
@@ -121,7 +119,6 @@ class BasicInfoModal(discord.ui.Modal, title="入社日程：基本情報"):
     async def on_submit(self, interaction: discord.Interaction):
         if user_has_blocking_entries(interaction.user.id):
             return await interaction.response.send_message("すでに登録済み、または面接済みのため再エントリーはできません。", ephemeral=True)
-
         TEMP_ENTRY[interaction.user.id] = {
             "name": str(self.name),
             "referrer": str(self.referrer),
@@ -142,11 +139,9 @@ class CustomTimeModal(discord.ui.Modal, title="入社日程：自由入力（そ
     async def on_submit(self, interaction: discord.Interaction):
         if user_has_blocking_entries(interaction.user.id):
             return await interaction.response.send_message("すでに登録済み、または面接済みのため再エントリーはできません。", ephemeral=True)
-
         data = TEMP_ENTRY.get(interaction.user.id)
         if not data:
             return await interaction.response.send_message("入力セッションが見つかりません。最初からやり直してください。", ephemeral=True)
-
         data["custom_time"] = str(self.custom_time)
         await post_panel_and_confirm(interaction, chosen_labels=["その他"], chosen_values=["other"])
 
@@ -164,14 +159,13 @@ class TimeSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         if user_has_blocking_entries(interaction.user.id):
             return await interaction.response.send_message("すでに登録済み、または面接済みのため再エントリーはできません。", ephemeral=True)
-
         values = list(self.values)
+        # 「その他」は単独選択のみ
         if "other" in values and len(values) > 1:
             return await interaction.response.send_message("「その他」は単独で選択してください。", ephemeral=True)
-
         if "other" in values:
             return await interaction.response.send_modal(CustomTimeModal())
-
+        # ラベル解決
         pairs = [(lbl, val) for (lbl, val) in TIME_OPTIONS if val in values]
         chosen_labels = [lbl for (lbl, _) in pairs]
         chosen_values = [val for (_, val) in pairs]
@@ -277,9 +271,72 @@ def add_entry_record(guild_id: int, channel_id: int, message_id: int,
     save_entries()
 
 # ==========================
-#  パネル送信
+#  “最下部ボタン”維持（スティッキー）
+# ==========================
+STICKY_TEXT = "やあ、よく来たね。入社日程について話そう"
+_channel_locks: Dict[int, asyncio.Lock] = {}
+_sticky_cooldown: Dict[int, float] = {}
+STICKY_COOLDOWN_SEC = 3.0
+
+def _channel_lock(channel_id: int) -> asyncio.Lock:
+    if channel_id not in _channel_locks:
+        _channel_locks[channel_id] = asyncio.Lock()
+    return _channel_locks[channel_id]
+
+async def post_sticky_message(channel: discord.TextChannel) -> Optional[int]:
+    try:
+        view = EntryButtonView()
+        msg = await channel.send(STICKY_TEXT, view=view)
+        return msg.id
+    except discord.Forbidden:
+        log.warning(f"Missing permissions to send sticky in #{channel.id}")
+    except Exception as e:
+        log.exception("Failed to send sticky message: %s", e)
+    return None
+
+async def delete_message_if_exists(channel: discord.TextChannel, message_id: int):
+    try:
+        msg = await channel.fetch_message(message_id)
+    except discord.NotFound:
+        return
+    except discord.Forbidden:
+        log.warning(f"Missing permissions to delete sticky in #{channel.id}")
+        return
+    except Exception:
+        return
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+async def ensure_sticky_bottom(channel: discord.TextChannel):
+    now = time.time()
+    last = _sticky_cooldown.get(channel.id, 0.0)
+    if now - last < STICKY_COOLDOWN_SEC:
+        return
+    _sticky_cooldown[channel.id] = now
+
+    lock = _channel_lock(channel.id)
+    async with lock:
+        last_msg: Optional[discord.Message] = None
+        async for m in channel.history(limit=1):
+            last_msg = m
+            break
+        current_sticky_id = STICKY_STATE.get(channel.id)
+        if last_msg and current_sticky_id and last_msg.id == current_sticky_id:
+            return
+        if current_sticky_id:
+            await delete_message_if_exists(channel, current_sticky_id)
+        new_id = await post_sticky_message(channel)
+        if new_id:
+            STICKY_STATE[channel.id] = new_id
+            save_sticky()
+
+# ==========================
+#  パネル送信（複数枠対応）＆ステータス操作
 # ==========================
 class EntryStatusControlView(discord.ui.View):
+    """エントリーパネル下の操作ボタン（面接済み / 応答無し）。永続ビュー。"""
     def __init__(self, disabled: bool = False):
         super().__init__(timeout=None)
         if disabled:
@@ -300,13 +357,18 @@ class EntryStatusControlView(discord.ui.View):
             return await interaction.response.send_message("対象エントリーが見つかりません。", ephemeral=True)
 
         if status_key == "interviewed":
+            # 同一ユーザーの active をすべて面接済みに
             uid = entry.get("user_id")
             for e in ENTRIES:
                 if e.get("user_id") == uid and e.get("status", "active") == "active":
                     e["status"] = "interviewed"
             save_entries()
         elif status_key == "no_response":
+            # このメッセージに紐づく枠のみ非表示
             entry["status"] = "no_response"
+            save_entries()
+        else:
+            entry["status"] = status_key
             save_entries()
 
         try:
@@ -331,55 +393,86 @@ async def post_panel_and_confirm(interaction: discord.Interaction, chosen_labels
     if not data:
         return await interaction.response.send_message("入力セッションが見つかりません。最初からやり直してください。", ephemeral=True)
 
+    # 表示用
+    display = " / ".join(data["custom_time"] if v == "other" else l for l, v in zip(chosen_labels, chosen_values))
+
+    # エントリーパネル送信
     embed = discord.Embed(title="入社エントリー", description="以下の内容で受付しました。", color=discord.Color.blue())
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="お名前", value=data["name"], inline=False)
-    embed.add_field(name="入社日程", value=" / ".join(
-        data["custom_time"] if val == "other" else lbl for lbl, val in zip(chosen_labels, chosen_values)
-    ), inline=False)
+    embed.add_field(name="入社日程", value=display, inline=False)
     embed.add_field(name="紹介者", value=data["referrer"], inline=False)
 
     target_channel = interaction.channel or (await user.create_dm())
     sent_msg = await target_channel.send(embed=embed, view=EntryStatusControlView())
 
+    # レコード保存（選択枠の数だけ登録）
     guild_id = interaction.guild.id if interaction.guild else 0
     for val in chosen_values:
         add_entry_record(
-            guild_id, sent_msg.channel.id, sent_msg.id,
-            user.id, data["name"], data["referrer"], val,
-            data.get("custom_time") if val == "other" else None
+            guild_id=guild_id,
+            channel_id=sent_msg.channel.id,
+            message_id=sent_msg.id,
+            user_id=user.id,
+            name=data["name"],
+            referrer=data["referrer"],
+            slot_key=val,
+            custom_time=data.get("custom_time") if val == "other" else None,
         )
 
     await interaction.response.send_message("送信しました。ありがとうございます！", ephemeral=True)
+
     if isinstance(target_channel, discord.TextChannel):
-        await update_schedule_panel()
+        await ensure_sticky_bottom(target_channel)
+    await update_schedule_panel()
 
 # ==========================
 #  コマンド
 # ==========================
-@tree.command(description="予定表を手動で更新")
+@tree.command(description="入社日程案内のボタンを“最下部に常時表示”として設置します")
+async def entry_panel(interaction: discord.Interaction):
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await interaction.response.send_message("このコマンドはテキストチャンネルで使ってください。", ephemeral=True)
+    await interaction.response.send_message("最下部にボタンを設置します。", ephemeral=True)
+    await ensure_sticky_bottom(interaction.channel)
+
+@tree.command(description="このチャンネルの“最下部ボタン”を解除します")
+async def entry_panel_off(interaction: discord.Interaction):
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await interaction.response.send_message("このコマンドはテキストチャンネルで使ってください。", ephemeral=True)
+    ch_id = interaction.channel.id
+    msg_id = STICKY_STATE.pop(ch_id, None)
+    save_sticky()
+    if msg_id:
+        await delete_message_if_exists(interaction.channel, msg_id)
+        await interaction.response.send_message("このチャンネルの最下部ボタンを解除しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("このチャンネルには有効な最下部ボタンがありません。", ephemeral=True)
+
+@tree.command(description="予定表を手動で再生成・更新します（ログチャンネル）")
 async def schedule_refresh(interaction: discord.Interaction):
     await update_schedule_panel()
     await interaction.response.send_message("予定表を更新しました。", ephemeral=True)
 
-@tree.command(description="疎通確認")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("pong 🏓")
-
 @tree.command(description="エントリー削除（管理者用）")
-@app_commands.describe(message_id="エントリーパネルのメッセージID", slot="時間帯を指定するとその枠のみ削除")
+@app_commands.describe(
+    message_id="エントリーパネルのメッセージID（リンク末尾の数字）",
+    slot="時間帯を指定するとその枠のみ削除。未指定で全枠削除"
+)
 @app_commands.choices(slot=[app_commands.Choice(name=label, value=value) for (label, value) in SLOT_ORDER])
 async def entry_delete(interaction: discord.Interaction, message_id: str, slot: Optional[app_commands.Choice[str]] = None):
+    # 権限チェック
     if not isinstance(interaction.user, discord.Member) or not any(r.id == ENTRY_MANAGER_ROLE_ID for r in interaction.user.roles):
         return await interaction.response.send_message("権限がありません。", ephemeral=True)
     try:
         mid = int(message_id)
     except ValueError:
         return await interaction.response.send_message("message_idは数値で指定してください。", ephemeral=True)
+
     slot_key = slot.value if slot else None
     count = 0
     for e in ENTRIES:
-        if e.get("message_id") == mid and e.get("status") == "active":
+        if e.get("message_id") == mid and e.get("status", "active") == "active":
             if slot_key is None or e.get("slot_key") == slot_key:
                 e["status"] = "deleted"
                 count += 1
@@ -388,7 +481,94 @@ async def entry_delete(interaction: discord.Interaction, message_id: str, slot: 
         await update_schedule_panel()
     await interaction.response.send_message(f"{count}件削除しました。", ephemeral=True)
 
-@tree.command(description="Botに発言させます（管理者用）")
-@app_commands.describe(content="本文", channel="送信先（未指定なら今のチャンネル）", allow_mentions="メンションを有効化")
-async def say(interaction: discord.Interaction, content: str, channel: Optional[discord.TextChannel] = None, allow_mentions: Optional[bool] = False):
-    if not isinstance(interaction.user, discord.Member) or not any(r
+@tree.command(description="Botにメッセージを送らせます（管理者用）")
+@app_commands.describe(
+    content="送信する本文（改行可）",
+    channel="送信先（未指定なら今のチャンネル）",
+    allow_mentions="@everyone/@here/ロール/ユーザーのメンションを有効化（既定:無効）"
+)
+async def say(
+    interaction: discord.Interaction,
+    content: str,
+    channel: Optional[discord.TextChannel] = None,
+    allow_mentions: Optional[bool] = False
+):
+    # 権限チェック
+    if not isinstance(interaction.user, discord.Member) or not any(r.id == ENTRY_MANAGER_ROLE_ID for r in interaction.user.roles):
+        return await interaction.response.send_message("権限がありません。", ephemeral=True)
+
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        return await interaction.response.send_message("テキストチャンネルで実行するか、送信先チャンネルを指定してください。", ephemeral=True)
+
+    mentions = (discord.AllowedMentions.all() if allow_mentions else discord.AllowedMentions.none())
+    try:
+        await target.send(content, allowed_mentions=mentions)
+        await interaction.response.send_message(f"送信しました → {target.mention}", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("送信先で権限不足です（SEND_MESSAGES）。", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"送信に失敗しました：{e}", ephemeral=True)
+
+@tree.command(description="疎通確認（/ping）")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("pong 🏓")
+
+# ==========================
+#  イベント
+# ==========================
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    await bot.process_commands(message)
+    if isinstance(message.channel, discord.TextChannel) and message.channel.id in STICKY_STATE:
+        await ensure_sticky_bottom(message.channel)
+
+@bot.event
+async def on_ready():
+    log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    load_states()
+
+    # 永続ビュー再登録
+    bot.add_view(EntryButtonView())
+    bot.add_view(EntryStatusControlView())
+
+    # 既存スティッキー整合
+    for ch_id in list(STICKY_STATE.keys()):
+        channel = bot.get_channel(ch_id)
+        if isinstance(channel, discord.TextChannel):
+            asyncio.create_task(ensure_sticky_bottom(channel))
+
+    # 予定表 初期更新
+    asyncio.create_task(update_schedule_panel())
+
+    # スラッシュ同期
+    if SYNC_ON_START:
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                synced = await tree.sync(guild=guild)
+                log.info(f"Synced {len(synced)} commands to guild {GUILD_ID}")
+            else:
+                synced = await tree.sync()
+                log.info(f"Synced {len(synced)} global commands")
+        except Exception as e:
+            log.exception("Failed to sync commands: %s", e)
+
+# ==========================
+#  エントリーポイント
+# ==========================
+def main():
+    if not DISCORD_TOKEN:
+        raise RuntimeError("環境変数 DISCORD_TOKEN が未設定です。Railway Variables で設定してください。")
+    bot.run(DISCORD_TOKEN)
+
+if __name__ == "__main__":
+    try:
+        # keep_alive 側がスレッド起動に対応している想定（未使用でもOK）
+        from keep_alive import run_server
+        run_server()
+    except Exception:
+        log.warning("keep_alive サーバーは起動しませんでした（ローカルなど）")
+    main()
