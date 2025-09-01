@@ -364,12 +364,14 @@ class EntryStatusControlView(discord.ui.View):
                     e["status"] = "interviewed"
             save_entries()
         elif status_key == "no_response":
-            # このメッセージに紐づく枠のみ非表示
-            entry["status"] = "no_response"
-            save_entries()
-        else:
-            entry["status"] = status_key
-            save_entries()
+            mid = entry.get("message_id")
+            changed = 0
+            for e in ENTRIES:
+                if e.get("message_id") == mid and e.get("status", "active") == "active":
+                e["status"] = "no_response"
+                changed += 1
+            if changed:
+               save_entries()
 
         try:
             await msg.edit(view=EntryStatusControlView(disabled=True))
@@ -572,3 +574,4 @@ if __name__ == "__main__":
     except Exception:
         log.warning("keep_alive サーバーは起動しませんでした（ローカルなど）")
     main()
+
